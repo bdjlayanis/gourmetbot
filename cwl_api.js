@@ -71,7 +71,7 @@ async function getCurrentCwlWar(clanTag) {
   const leagueGroup = await getCwlLeagueGroup(clanTag);
   const rounds = leagueGroup.rounds || [];
 
-  let bestWar = null;      // fallback: most recent ended war
+  let bestWar = null;      // fallback: most recent non-inWar war
   let bestRoundIndex = -1;
 
   for (let i = rounds.length - 1; i >= 0; i--) {
@@ -80,15 +80,13 @@ async function getCurrentCwlWar(clanTag) {
 
     if (!war) continue;
 
+    // Active battle day — always highest priority
     if (war.state === "inWar") {
       return { war, roundIndex: i + 1, leagueGroup };
     }
 
-    if (war.state === "preparation") {
-      return { war, roundIndex: i + 1, leagueGroup };
-    }
-
-    if (war.state === "warEnded" && !bestWar) {
+    // Save the most recent prep or ended war as fallback
+    if ((war.state === "preparation" || war.state === "warEnded") && !bestWar) {
       bestWar = war;
       bestRoundIndex = i + 1;
     }

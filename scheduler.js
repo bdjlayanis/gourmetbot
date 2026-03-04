@@ -366,18 +366,40 @@ async function runBedtimeCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToCh
   const users = Object.entries(bedtimeMap);
   if (users.length === 0) return;
 
+  // Try regular war first
   let warData;
+  let isCwl = false;
   try {
     warData = await getCurrentWar(CLAN_TAG);
   } catch {
-    return;
+    warData = null;
   }
 
-  if (warData.state !== "inWar") return;
+  // If no regular war active, try CWL
+  if (!warData || warData.state !== "inWar") {
+    try {
+      const cwlResult = await getCurrentCwlWar(CLAN_TAG);
+      if (cwlResult && cwlResult.war.state === "inWar") {
+        warData = cwlResult.war;
+        isCwl = true;
+      }
+    } catch {
+      // No CWL either — fall through
+    }
+  }
 
-  const groups = groupMembersByAttacks(warData);
-  if (!groups) return;
-  const playersToRemind = getPlayersToRemind(groups);
+  if (!warData || warData.state !== "inWar") return;
+
+  let playersToRemind;
+  if (isCwl) {
+    const groups = groupCwlMembersByAttacks(warData);
+    if (!groups) return;
+    playersToRemind = getCwlPlayersToRemind(groups);
+  } else {
+    const groups = groupMembersByAttacks(warData);
+    if (!groups) return;
+    playersToRemind = getPlayersToRemind(groups);
+  }
   if (playersToRemind.length === 0) return;
 
   const tagsToRemind = new Set(playersToRemind.map((p) => p.tag));
@@ -416,8 +438,9 @@ async function runBedtimeCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToCh
     const needsAttack = linkedTags.some((tag) => tagsToRemind.has(tag));
     if (!needsAttack) continue;
 
+    const warType = isCwl ? "CWL" : "war";
     await sendToChannel(
-      `🌙 <@${discordId}> — Bedtime in ~${minutesUntilBed} min! You still have war attacks left. Get them in before you sleep!`
+      `🌙 <@${discordId}> — Bedtime in ~${minutesUntilBed} min! You still have ${warType} attacks left. Get them in before you sleep!`
     );
     spamGuard.bedtimeRemindedOn[discordId] = userDateStr;
     console.log(`[bedtime] Reminder sent to ${discordId} (${time} UTC${utcOffset >= 0 ? "+" : ""}${utcOffset}).`);
