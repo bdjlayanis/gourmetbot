@@ -44,6 +44,23 @@ function formatPlayerLine(player, playerDiscordMap, { suppressPing = false } = {
 }
 
 /**
+ * Build a roster listing of every player on our side of the war.
+ * Sorted by map position so it reads top-down like the in-game roster.
+ * Linked players show as @mentions; unlinked players show their CoC name.
+ */
+function buildParticipantList(warData, playerDiscordMap) {
+  const members = warData.clan.members || [];
+  const sorted = [...members].sort((a, b) => a.mapPosition - b.mapPosition);
+  const lines = [`**Participants (${members.length}):**`];
+  for (const m of sorted) {
+    const discordId = playerDiscordMap[m.tag];
+    const label = discordId ? `<@${discordId}>` : m.name;
+    lines.push(`${m.mapPosition}. ${label}`);
+  }
+  return lines.join("\n");
+}
+
+/**
  * Convert a CoC API date into a Discord dynamic timestamp (<t:unix:F>).
  * Discord renders these in the user's local timezone automatically.
  */
@@ -514,6 +531,7 @@ function buildCwlStatsMessage(playerStats, season) {
 module.exports = {
   formatPlayerLine,
   formatWarDate,
+  buildParticipantList,
   buildExtendedInfo,
   buildAttackDetails,
   buildWarMessage,

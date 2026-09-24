@@ -23,7 +23,7 @@
 const { CLAN_TAG, AUTO_CHECK_INTERVAL_MS, REMINDER_THRESHOLDS_HOURS } = require("./config");
 const { getCurrentWar, parseWarDate, cocErrorMessage } = require("./coc_api");
 const { getWarScoreboard, isWarDecided, getTimeRemaining, groupMembersByAttacks, getPlayersToRemind } = require("./war_analysis");
-const { formatPlayerLine, formatCwlPlayerLine } = require("./discord_messages");
+const { formatPlayerLine, formatCwlPlayerLine, buildParticipantList } = require("./discord_messages");
 const { getCurrentCwlWar } = require("./cwl_api");
 const { groupCwlMembersByAttacks, getCwlPlayersToRemind } = require("./cwl_analysis");
 const { loadSpamGuard, saveSpamGuard } = require("./persistence");
@@ -135,6 +135,8 @@ async function runAutoWarCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToCh
         `vs **${warData.opponent.name}** — ${warData.teamSize}v${warData.teamSize}`,
         `War ends: <t:${endUnix}:R> (<t:${endUnix}:F>)`,
         `Good luck!`,
+        "",
+        buildParticipantList(warData, playerDiscordMap),
       ];
       await sendToChannel(lines.join("\n"));
       spamGuard.warStartSentForWar = warData.endTime;
@@ -278,6 +280,8 @@ async function runAutoCwlCheck(spamGuard, playerDiscordMap, sendToChannel) {
       `vs **${warData.opponent.name}** — ${warData.teamSize}v${warData.teamSize}`,
       `War ends: <t:${endUnix}:R> (<t:${endUnix}:F>)`,
       `Remember: **1 attack** per player!`,
+      "",
+      buildParticipantList(warData, playerDiscordMap),
     ];
     await sendToChannel(lines.join("\n"));
     spamGuard.cwlWarStartSentForWar = warData.endTime;
