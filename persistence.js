@@ -2,16 +2,17 @@
 // persistence.js — Read/write JSON data files to disk
 // =============================================================
 //
-// Three JSON files store the bot's persistent state:
+// Four JSON files store the bot's persistent state:
 //
 //   player_map.json   — CoC player tag → Discord user ID links
-//   bedtime_map.json  — Discord user ID → { time, utcOffset } settings
+//   bedtime_map.json  — Discord user ID → { time, timeZone } settings
 //   spam_guard.json   — Anti-spam state so the bot doesn't repeat
 //                        messages after a restart
+//   war_history.json  — Missed attacks per player for every ended war
 //
-// The spam guard uses an atomic write (write to .tmp then rename)
-// so a crash mid-write can't corrupt the file. The other two files
-// are small enough that corruption risk is negligible.
+// The spam guard and war history use an atomic write (write to .tmp
+// then rename) so a crash mid-write can't corrupt them. The other two
+// files are small enough that corruption risk is negligible.
 // =============================================================
 
 const fs = require("fs");
@@ -21,6 +22,21 @@ const path = require("path");
 const PLAYER_MAP_FILE = path.join(__dirname, "player_map.json");
 const BEDTIME_MAP_FILE = path.join(__dirname, "bedtime_map.json");
 const SPAM_GUARD_FILE = path.join(__dirname, "spam_guard.json");
+const WAR_HISTORY_FILE = path.join(__dirname, "war_history.json");
+
+/** Write JSON via temp file + rename, so a crash mid-write can't corrupt it. */
+function writeJsonAtomic(file, json) {
+  fs.writeFileSync(file + ".tmp", json);
+  fs.renameSync(file + ".tmp", file);
+}
+
+/**
+ * Fixed UTC offset in hours → IANA zone name. Note the inverted sign:
+ * "Etc/GMT-2" is UTC+2. Fixed zones have no daylight saving time.
+ */
+function offsetToTimeZone(hours) {
+  return hours === 0 ? "UTC" : `Etc/GMT${hours > 0 ? "-" : "+"}${Math.abs(hours)}`;
+}
 
 /** Load the CoC tag → Discord ID map. Returns {} if the file doesn't exist yet. */
 function loadPlayerMap() {
@@ -37,11 +53,20 @@ function savePlayerMap(data) {
   fs.writeFileSync(PLAYER_MAP_FILE, JSON.stringify(data, null, 2));
 }
 
-/** Load bedtime settings. Returns {} if the file doesn't exist yet. */
+/**
+ * Load bedtime settings. Returns {} if the file doesn't exist yet.
+ * Old entries stored a fixed { utcOffset }; they become a fixed zone
+ * so they keep working (users re-run /bedtime to get DST handling).
+ */
 function loadBedtimeMap() {
   try {
     const raw = fs.readFileSync(BEDTIME_MAP_FILE, "utf-8");
-    return JSON.parse(raw);
+    const data = JSON.parse(raw);
+    for (const settings of Object.values(data)) {
+      settings.timeZone ??= offsetToTimeZone(settings.utcOffset);
+      delete settings.utcOffset;
+    }
+    return data;
   } catch {
     return {};
   }
@@ -68,27 +93,13 @@ function loadSpamGuard() {
     const data = JSON.parse(raw);
 
     // Convert threshold arrays back to Sets for fast .has() lookups
-    const sentThresholds = {};
-    for (const [key, arr] of Object.entries(data.sentThresholds || {})) {
-      sentThresholds[key] = new Set(arr);
-    }
-    const cwlSentThresholds = {};
-    for (const [key, arr] of Object.entries(data.cwlSentThresholds || {})) {
-      cwlSentThresholds[key] = new Set(arr);
+    for (const field of ["sentThresholds", "cwlSentThresholds", "raidSentThresholds"]) {
+      for (const [key, arr] of Object.entries(data[field] || {})) {
+        data[field][key] = new Set(arr);
+      }
     }
 
-    return {
-      lastAutoReminderAt: data.lastAutoReminderAt || null,
-      sentThresholds,
-      warEndSentForWar: data.warEndSentForWar || null,
-      preparationSentForWar: data.preparationSentForWar || null,
-      warStartSentForWar: data.warStartSentForWar || null,
-      bedtimeRemindedOn: data.bedtimeRemindedOn || {},
-      cwlSentThresholds,
-      cwlPreparationSentForWar: data.cwlPreparationSentForWar || null,
-      cwlWarStartSentForWar: data.cwlWarStartSentForWar || null,
-      cwlWarEndSentForWar: data.cwlWarEndSentForWar || null,
-    };
+    return data;
   } catch (err) {
     console.error("[spam-guard] Failed to load spam_guard.json:", err.message);
     return null;
@@ -103,36 +114,38 @@ function loadSpamGuard() {
  * mid-write can't corrupt the file and cause duplicate messages.
  */
 function saveSpamGuard(guard) {
-  // Convert Sets to arrays for JSON serialization
-  const sentThresholds = {};
-  for (const [key, set] of Object.entries(guard.sentThresholds || {})) {
-    sentThresholds[key] = [...set];
-  }
-  const cwlSentThresholds = {};
-  for (const [key, set] of Object.entries(guard.cwlSentThresholds || {})) {
-    cwlSentThresholds[key] = [...set];
-  }
+  // Every field is saved (no whitelist to forget to update);
+  // Sets become arrays since JSON has no Set type
+  const json = JSON.stringify(guard, (key, value) => (value instanceof Set ? [...value] : value), 2);
 
-  const data = {
-    lastAutoReminderAt: guard.lastAutoReminderAt,
-    sentThresholds,
-    warEndSentForWar: guard.warEndSentForWar,
-    preparationSentForWar: guard.preparationSentForWar,
-    warStartSentForWar: guard.warStartSentForWar,
-    bedtimeRemindedOn: guard.bedtimeRemindedOn,
-    cwlSentThresholds,
-    cwlPreparationSentForWar: guard.cwlPreparationSentForWar,
-    cwlWarStartSentForWar: guard.cwlWarStartSentForWar,
-    cwlWarEndSentForWar: guard.cwlWarEndSentForWar,
-  };
+  writeJsonAtomic(SPAM_GUARD_FILE, json);
+}
 
-  // Atomic write: temp file + rename prevents corruption on crash
-  const tmpFile = SPAM_GUARD_FILE + ".tmp";
-  fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
-  fs.renameSync(tmpFile, SPAM_GUARD_FILE);
+/**
+ * Load the recorded wars: [{ endTime, cwl, opponent, members: [{ tag, name, missed }] }].
+ * Returns [] if the file doesn't exist yet.
+ */
+function loadWarHistory() {
+  try {
+    return JSON.parse(fs.readFileSync(WAR_HISTORY_FILE, "utf-8"));
+  } catch {
+    return [];
+  }
+}
+
+/** Record one ended war. Ignored if that war (same endTime) is already in. */
+function appendWarHistory(entry) {
+  const history = loadWarHistory();
+  if (history.some((w) => w.endTime === entry.endTime)) return;
+  // ponytail: grows ~150 wars/year (~200 KB), prune old entries if it ever matters
+  history.push(entry);
+  writeJsonAtomic(WAR_HISTORY_FILE, JSON.stringify(history));
 }
 
 module.exports = {
+  offsetToTimeZone,
+  loadWarHistory,
+  appendWarHistory,
   loadPlayerMap,
   savePlayerMap,
   loadBedtimeMap,

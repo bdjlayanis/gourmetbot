@@ -133,6 +133,18 @@ async function getCwlWar(warTag) {
   return response.data;
 }
 
+/**
+ * Fetch the latest Clan Capital raid weekend (state "ongoing" or "ended").
+ * Its members list only includes players who attacked at least once.
+ * Returns null if the clan never raided.
+ */
+async function getCapitalRaidSeason(clanTag) {
+  const encoded = encodeClanTag(clanTag);
+  const url = `${COC_API_BASE}/clans/${encoded}/capitalraidseasons?limit=1`;
+  const response = await axios.get(url, { headers: authHeaders() });
+  return response.data.items?.[0] ?? null;
+}
+
 // ---- Date parsing -------------------------------------------
 
 /**
@@ -185,6 +197,7 @@ module.exports = {
   getClanWarLog,
   getCwlLeagueGroup,
   getCwlWar,
+  getCapitalRaidSeason,
   parseWarDate,
   cocErrorMessage,
 };

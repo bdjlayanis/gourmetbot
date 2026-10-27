@@ -8,14 +8,19 @@ A Discord bot that monitors your clan's wars via the Clash of Clans API and send
 - Detects new wars and announces preparation day + battle day start
 - Sends countdown reminders at configurable thresholds (12h, 6h, 4h, 2h, 1h before war ends)
 - @mentions linked players who haven't used their attacks
-- Posts a summary with the final result when the war ends
+- Posts a summary with the final result and missed attacks when the war ends
 - Skips reminders when the war outcome is already mathematically decided
+- Records every ended war so `/missed` can show who skips attacks over time
 
 **Clan War League (CWL)**
 - Tracks CWL rounds with the same announcement/reminder lifecycle
 - `/cwl-check` — see who still needs to attack in the current CWL round
 - `/cwl-standings` — view the ranked standings of all 8 clans in the group
 - `/cwl-stats` — per-player CWL performance across all rounds
+
+**Raid Weekend (Clan Capital)**
+- Announces the start, reminds players who started raiding but have attacks left (24h and 4h before the end by default), posts loot + top raiders when it ends
+- `/raid-check` — see who started raiding but still has attacks left
 
 **Slash Commands**
 | Command | Description |
@@ -29,12 +34,14 @@ A Discord bot that monitors your clan's wars via the Clash of Clans API and send
 | `/clan-stats` | Clan level, war record, member count, league |
 | `/player-stats <player>` | Player profile + current war performance |
 | `/war-log [count]` | Recent war results (1-10, default 5) |
-| `/bedtime <time> <utc_offset>` | Set a personal bedtime reminder (e.g. `/bedtime 23:00 +2`) |
+| `/missed [days]` | Players ranked by missed attacks, wars + CWL (default 30 days) |
+| `/raid-check` | Raid weekend status and who has raid attacks left |
+| `/bedtime <time> <timezone>` | Set a personal bedtime reminder (e.g. `/bedtime 23:00 Europe/Paris`) |
 | `/bedtime-clear` | Remove your bedtime reminder |
 | `/help` | Show all commands |
 
 **Bedtime Reminders**
-- Players can set a personal bedtime with `/bedtime`
+- Players can set a personal bedtime with `/bedtime`, using a time zone like `Europe/Paris` (follows summer/winter time) or a fixed offset like `+2`
 - If a war is active and they still have attacks left, the bot pings them ~30 minutes before bedtime
 
 ## Architecture
@@ -50,20 +57,22 @@ cwl_analysis.js       ← CWL analysis: standings, per-player stats
 discord_messages.js   ← All Discord message formatting (markdown builders)
 commands.js           ← Slash command definitions, registration, handlers
 scheduler.js          ← Auto war check timer, CWL check, bedtime check, anti-spam
-persistence.js        ← Read/write JSON data files (player links, bedtimes, spam guard)
+persistence.js        ← Read/write JSON data files (player links, bedtimes, spam guard, war history)
+test.js               ← Self-check of the pure logic: node test.js
 ```
 
 **Data files** (created at runtime, gitignored):
 - `player_map.json` — CoC player tag → Discord user ID
 - `bedtime_map.json` — Discord user ID → bedtime settings
 - `spam_guard.json` — Anti-spam state so restarts don't cause duplicate messages
+- `war_history.json` — Missed attacks per player for every ended war (used by `/missed`)
 
 ## Setup
 
 ### Prerequisites
 - [Node.js](https://nodejs.org/) v18 or later
 - A [Clash of Clans API token](https://developer.clashofclans.com) (IP-locked to your server)
-- A [Discord bot application](https://discord.com/developers/applications) with the `bot` scope and `applications.commands` permission
+- A [Discord bot application](https://discord.com/developers/applications) with the `bot` scope and `applications.commands` permission, plus **Send Messages** and **Embed Links** in the reminder channel (messages are sent as embeds)
 
 ### Installation
 
@@ -104,4 +113,4 @@ The bot also checks if the war is **mathematically decided** (neither side can c
 
 ## Anti-Spam
 
-Each message type (prep announcement, battle day start, countdown threshold, war-ended summary) fires **exactly once per war**. State is persisted to `spam_guard.json` using atomic writes so a bot restart mid-war won't cause duplicate messages.
+Each message type (prep announcement, battle day start, countdown threshold, war-ended summary, raid announcements) fires **exactly once per war**. State is persisted to `spam_guard.json` using atomic writes so a bot restart mid-war won't cause duplicate messages.

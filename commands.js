@@ -6,13 +6,13 @@
 //
 //   1. Command definitions  — what shows up in the Discord "/" menu
 //   2. Registration         — pushes definitions to the Discord API per guild
-//   3. Autocomplete handler — fuzzy-searches clan members for /link and /player-stats
+//   3. Autocomplete handler — clan members for /link and /player-stats, time zones for /bedtime
 //   4. Command handlers     — the logic behind each slash command
 //
 // Supported commands:
 //   /war-check, /link, /links, /clan-stats, /player-stats,
 //   /war-log, /bedtime, /bedtime-clear, /cwl-check,
-//   /cwl-standings, /cwl-stats, /help
+//   /cwl-standings, /cwl-stats, /missed, /raid-check, /help
 // =============================================================
 
 const { SlashCommandBuilder, REST, Routes } = require("discord.js");
@@ -28,9 +28,14 @@ const {
   getClanInfo,
   getPlayerInfo,
   getClanWarLog,
+  getCapitalRaidSeason,
+  parseWarDate,
   cocErrorMessage,
 } = require("./coc_api");
 const {
+  toEmbedMessages,
+  buildMissedAttacksMessage,
+  buildRaidMessage,
   buildWarMessage,
   buildClanStatsMessage,
   buildPlayerStatsMessage,
@@ -42,7 +47,11 @@ const {
 const { getCurrentCwlWar, getAllCwlWarsForClan, getAllCwlRoundWars } = require("./cwl_api");
 const { getCwlLeagueGroup } = require("./coc_api");
 const { computeCwlStandings, computeCwlPlayerStats } = require("./cwl_analysis");
-const { savePlayerMap, saveBedtimeMap } = require("./persistence");
+const { computeMissedAttacks } = require("./war_analysis");
+const { savePlayerMap, saveBedtimeMap, loadWarHistory, offsetToTimeZone } = require("./persistence");
+
+// All IANA zones known to Node (e.g. "Europe/Paris"), for /bedtime autocomplete
+const TIME_ZONES = Intl.supportedValuesOf("timeZone");
 
 // ---- Clan member cache (private to this module) -------------
 // Cached so autocomplete doesn't hit the CoC API on every keystroke.
@@ -70,6 +79,13 @@ async function getCachedClanMembers() {
     console.error("Failed to fetch clan members for autocomplete:", err.message);
     return memberCache.members;
   }
+}
+
+/** Reply to a deferred command as embed(s): editReply the first, followUp the rest. */
+async function replyLong(interaction, text) {
+  const [first, ...rest] = toEmbedMessages(text);
+  await interaction.editReply(first);
+  for (const message of rest) await interaction.followUp(message);
 }
 
 // ---- Command definitions ------------------------------------
@@ -136,9 +152,10 @@ function getCommandDefinitions() {
     )
     .addStringOption((opt) =>
       opt
-        .setName("utc_offset")
-        .setDescription("Your UTC offset, e.g. +2 or -5")
+        .setName("timezone")
+        .setDescription("Your time zone, e.g. Europe/Paris (handles summer time). A fixed offset like +2 also works.")
         .setRequired(true)
+        .setAutocomplete(true)
     );
 
   const bedtimeClearCommand = new SlashCommandBuilder()
@@ -157,6 +174,22 @@ function getCommandDefinitions() {
     .setName("cwl-stats")
     .setDescription("Show per-player CWL performance across all rounds.");
 
+  const missedCommand = new SlashCommandBuilder()
+    .setName("missed")
+    .setDescription("Rank players by missed war attacks (wars and CWL rounds).")
+    .addIntegerOption((opt) =>
+      opt
+        .setName("days")
+        .setDescription("How far back to look (default 30)")
+        .setMinValue(1)
+        .setMaxValue(365)
+        .setRequired(false)
+    );
+
+  const raidCheckCommand = new SlashCommandBuilder()
+    .setName("raid-check")
+    .setDescription("Check the raid weekend and see who still has raid attacks left.");
+
   const helpCommand = new SlashCommandBuilder()
     .setName("help")
     .setDescription("Show all available commands and what the bot does.");
@@ -173,6 +206,8 @@ function getCommandDefinitions() {
     cwlCheckCommand,
     cwlStandingsCommand,
     cwlStatsCommand,
+    missedCommand,
+    raidCheckCommand,
     helpCommand,
   ];
 }
@@ -220,9 +255,16 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
     if (!interaction.isAutocomplete()) return;
 
     const { commandName } = interaction;
-    if (commandName !== "link" && commandName !== "player-stats") return;
-
     const focused = interaction.options.getFocused().toLowerCase();
+
+    // /bedtime timezone: search the IANA zone list ("paris" → Europe/Paris)
+    if (commandName === "bedtime") {
+      const zones = TIME_ZONES.filter((z) => z.toLowerCase().includes(focused)).slice(0, 25);
+      await interaction.respond(zones.map((z) => ({ name: z, value: z })));
+      return;
+    }
+
+    if (commandName !== "link" && commandName !== "player-stats") return;
 
     try {
       const members = await getCachedClanMembers();
@@ -258,7 +300,7 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
       try {
         const warData = await getCurrentWar(CLAN_TAG);
         const message = buildWarMessage(warData, playerDiscordMap, { isManual: true });
-        await interaction.editReply(message);
+        await replyLong(interaction, message);
       } catch (error) {
         const errMsg = cocErrorMessage(error);
         console.error("war-check error:", errMsg);
@@ -316,9 +358,7 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
         })
       );
 
-      await interaction.editReply(
-        `**Linked players (${entries.length}):**\n${lines.join("\n")}`
-      );
+      await replyLong(interaction, `**Linked players (${entries.length}):**\n${lines.join("\n")}`);
       return;
     }
 
@@ -327,7 +367,7 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
       await interaction.deferReply();
       try {
         const info = await getClanInfo(CLAN_TAG);
-        await interaction.editReply(buildClanStatsMessage(info));
+        await replyLong(interaction, buildClanStatsMessage(info));
       } catch (error) {
         await interaction.editReply(`❌ ${cocErrorMessage(error)}`);
       }
@@ -346,7 +386,7 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
           getPlayerInfo(tag),
           getCurrentWar(CLAN_TAG).catch(() => null),
         ]);
-        await interaction.editReply(buildPlayerStatsMessage(playerInfo, warData, tag));
+        await replyLong(interaction, buildPlayerStatsMessage(playerInfo, warData, tag));
       } catch (error) {
         await interaction.editReply(`❌ ${cocErrorMessage(error)}`);
       }
@@ -361,7 +401,7 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
 
       try {
         const entries = await getClanWarLog(CLAN_TAG, count);
-        await interaction.editReply(buildWarLogMessage(entries));
+        await replyLong(interaction, buildWarLogMessage(entries));
       } catch (error) {
         if (error.response?.status === 403) {
           await interaction.editReply(
@@ -375,10 +415,10 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
     }
 
     // /bedtime — set a personal bedtime reminder for war days
-    // Validates HH:MM format and UTC offset, then stores in bedtime_map.json.
+    // Validates HH:MM format and time zone, then stores in bedtime_map.json.
     if (commandName === "bedtime") {
       const timeStr = interaction.options.getString("time").trim();
-      const offsetStr = interaction.options.getString("utc_offset").trim();
+      const zoneStr = interaction.options.getString("timezone").trim();
 
       const timeMatch = timeStr.match(/^(\d{1,2}):(\d{2})$/);
       if (!timeMatch) {
@@ -392,27 +432,32 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
         return;
       }
 
-      const offsetMatch = offsetStr.match(/^([+-]?)(\d{1,2})$/);
-      if (!offsetMatch) {
-        await interaction.reply({ content: "❌ Invalid UTC offset. Use e.g. `+2`, `-5`, `0`.", ephemeral: true });
+      // Either a fixed offset ("+2", "UTC-5") or an IANA zone ("Europe/Paris")
+      const offsetMatch = zoneStr.match(/^(?:UTC|GMT)?([+-]?\d{1,2})$/i);
+      const utcOffset = offsetMatch ? parseInt(offsetMatch[1], 10) : null;
+      if (utcOffset !== null && (utcOffset < -12 || utcOffset > 14)) {
+        await interaction.reply({ content: "❌ UTC offset must be between -12 and +14.", ephemeral: true });
         return;
       }
-      const utcOffset = offsetMatch[1] === "-"
-        ? -parseInt(offsetMatch[2], 10)
-        : parseInt(offsetMatch[2], 10);
 
-      if (utcOffset < -12 || utcOffset > 14) {
-        await interaction.reply({ content: "❌ UTC offset must be between -12 and +14.", ephemeral: true });
+      let timeZone;
+      try {
+        // Intl throws on unknown zones and canonicalises case ("europe/paris" → "Europe/Paris")
+        timeZone = new Intl.DateTimeFormat("en-US", {
+          timeZone: utcOffset !== null ? offsetToTimeZone(utcOffset) : zoneStr,
+        }).resolvedOptions().timeZone;
+      } catch {
+        await interaction.reply({ content: "❌ Unknown time zone. Pick one from the list (e.g. `Europe/Paris`) or use an offset like `+2`.", ephemeral: true });
         return;
       }
 
       const normalised = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 
-      bedtimeMap[interaction.user.id] = { time: normalised, utcOffset };
+      bedtimeMap[interaction.user.id] = { time: normalised, timeZone };
       saveBedtimeMap(bedtimeMap);
 
-      const sign = utcOffset >= 0 ? "+" : "";
-      await interaction.reply(`✅ Bedtime set to **${normalised}** (UTC${sign}${utcOffset}). You'll be reminded ~30 min before if there's an active war and you still need to attack.`);
+      const dstNote = utcOffset !== null ? "\n-# Fixed offset: it won't follow summer/winter time. Pick a zone like `Europe/Paris` for that." : "";
+      await interaction.reply(`✅ Bedtime set to **${normalised}** (${timeZone}). You'll be reminded ~30 min before if there's an active war and you still need to attack.${dstNote}`);
       return;
     }
 
@@ -440,7 +485,7 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
           return;
         }
         const message = buildCwlWarMessage(result.war, result.roundIndex, playerDiscordMap, { isManual: true });
-        await interaction.editReply(message);
+        await replyLong(interaction, message);
       } catch (error) {
         if (error.response?.status === 404) {
           await interaction.editReply("The clan is not currently in CWL.");
@@ -465,7 +510,7 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
         const allWars = await getAllCwlRoundWars(leagueGroup);
         const standings = computeCwlStandings(allWars, leagueGroup.clans || []);
         const season = leagueGroup.season || null;
-        await interaction.editReply(buildCwlStandingsMessage(standings, season));
+        await replyLong(interaction, buildCwlStandingsMessage(standings, season));
       } catch (error) {
         if (error.response?.status === 404) {
           await interaction.editReply("The clan is not currently in CWL.");
@@ -489,7 +534,7 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
         const { wars, leagueGroup } = await getAllCwlWarsForClan(CLAN_TAG);
         const playerStats = computeCwlPlayerStats(wars);
         const season = leagueGroup.season || null;
-        await interaction.editReply(buildCwlStatsMessage(playerStats, season));
+        await replyLong(interaction, buildCwlStatsMessage(playerStats, season));
       } catch (error) {
         if (error.response?.status === 404) {
           await interaction.editReply("The clan is not currently in CWL.");
@@ -506,6 +551,28 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
       return;
     }
 
+    // /missed — rank players by missed attacks over the last N days
+    if (commandName === "missed") {
+      await interaction.deferReply();
+      const days = interaction.options.getInteger("days") ?? 30;
+      const since = Date.now() - days * 24 * 60 * 60 * 1000;
+      const wars = loadWarHistory().filter((w) => parseWarDate(w.endTime).getTime() >= since);
+      await replyLong(interaction, buildMissedAttacksMessage(computeMissedAttacks(wars), days, wars.length));
+      return;
+    }
+
+    // /raid-check — raid weekend status and who still has raid attacks left
+    if (commandName === "raid-check") {
+      await interaction.deferReply();
+      try {
+        const raid = await getCapitalRaidSeason(CLAN_TAG);
+        await replyLong(interaction, buildRaidMessage(raid, playerDiscordMap, { isManual: true }));
+      } catch (error) {
+        await interaction.editReply(`❌ ${cocErrorMessage(error)}`);
+      }
+      return;
+    }
+
     // /help — show all available commands (ephemeral so only the caller sees it)
     if (commandName === "help") {
       const helpText = [
@@ -514,6 +581,10 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
         "**War Commands:**",
         "`/war-check` — Check the current war status and see who still needs to attack.",
         "`/war-log [count]` — Show recent war results (1–10, default 5).",
+        "`/missed [days]` — Rank players by missed attacks (wars + CWL, default 30 days).",
+        "",
+        "**Raid Weekend:**",
+        "`/raid-check` — Raid weekend status and who still has raid attacks left.",
         "",
         "**CWL Commands:**",
         "`/cwl-check` — Check the current CWL war and see who still needs to attack.",
@@ -525,7 +596,7 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
         "`/links` — Show all linked players.",
         "`/clan-stats` — Show clan level, war record, member count, and league.",
         "`/player-stats <player>` — Show a player's stats and current war performance.",
-        "`/bedtime <time> <utc_offset>` — Set a personal bedtime reminder (e.g. `/bedtime 23:00 +2`).",
+        "`/bedtime <time> <timezone>` — Set a personal bedtime reminder (e.g. `/bedtime 23:00 Europe/Paris`).",
         "`/bedtime-clear` — Remove your bedtime reminder.",
         "`/help` — Show this message.",
         "",
@@ -533,6 +604,7 @@ function setupHandlers(client, playerDiscordMap, bedtimeMap) {
         "The bot checks for active wars and CWL every 30 minutes and pings players who haven't used their attacks.",
         "Countdown alerts fire at 12h, 6h, 4h, 2h, and 1h remaining.",
         "A summary with the result is posted when each war ends.",
+        "Raid weekends get a start announcement, reminders for unused raid attacks, and an end summary.",
       ];
       await interaction.reply({ content: helpText.join("\n"), ephemeral: true });
       return;

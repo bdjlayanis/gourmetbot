@@ -10,6 +10,8 @@
 // per-player performance stats.
 // =============================================================
 
+const { getWarScoreboard, getWarResult } = require("./war_analysis");
+
 /**
  * Group CWL war members by attack count.
  * Only two buckets: 0 (hasn't attacked) or 1 (has attacked).
@@ -85,18 +87,19 @@ function computeCwlStandings(allWars, leagueClans) {
     stats[oppTag].destruction += war.opponent.destructionPercentage;
     stats[oppTag].roundsPlayed++;
 
-    if (war.clan.stars > war.opponent.stars) {
+    // A round in progress has no winner yet
+    if (war.state !== "warEnded") continue;
+
+    // Winner gets 10 bonus stars in the standings, like in-game
+    const result = getWarResult(getWarScoreboard(war));
+    if (result === "Victory") {
       stats[clanTag].wins++;
+      stats[clanTag].stars += 10;
       stats[oppTag].losses++;
-    } else if (war.clan.stars < war.opponent.stars) {
+    } else if (result === "Defeat") {
       stats[clanTag].losses++;
       stats[oppTag].wins++;
-    } else if (war.clan.destructionPercentage > war.opponent.destructionPercentage) {
-      stats[clanTag].wins++;
-      stats[oppTag].losses++;
-    } else if (war.clan.destructionPercentage < war.opponent.destructionPercentage) {
-      stats[clanTag].losses++;
-      stats[oppTag].wins++;
+      stats[oppTag].stars += 10;
     } else {
       stats[clanTag].ties++;
       stats[oppTag].ties++;

@@ -3,11 +3,15 @@
 // =============================================================
 //
 // This module runs on a timer (every 30 min by default) and handles
-// three independent jobs each cycle:
+// four independent jobs each cycle:
 //
 //   1. Regular war check  — announce prep/start, countdown reminders, war-ended summary
 //   2. CWL war check      — same lifecycle events but for Clan War League rounds
-//   3. Bedtime check      — DM players who are about to go to sleep with attacks left
+//   3. Raid weekend check — start announcement, reminders, end summary
+//   4. Bedtime check      — ping players who are about to go to sleep with attacks left
+//
+// Every ended war (regular or CWL round) is also recorded to
+// war_history.json for the /missed command.
 //
 // Anti-spam ("spam guard") ensures each message type is sent only once
 // per war. State is persisted to spam_guard.json so restarts don't
@@ -20,13 +24,33 @@
 //   - Each threshold fires exactly once per war
 // =============================================================
 
-const { CLAN_TAG, AUTO_CHECK_INTERVAL_MS, REMINDER_THRESHOLDS_HOURS } = require("./config");
-const { getCurrentWar, parseWarDate, cocErrorMessage } = require("./coc_api");
-const { getWarScoreboard, isWarDecided, getTimeRemaining, groupMembersByAttacks, getPlayersToRemind } = require("./war_analysis");
-const { formatPlayerLine, formatCwlPlayerLine, buildParticipantList } = require("./discord_messages");
-const { getCurrentCwlWar } = require("./cwl_api");
+const {
+  CLAN_TAG,
+  REMINDER_THRESHOLDS_HOURS,
+  RAID_REMINDER_THRESHOLDS_HOURS = [24, 4],  // default for config.js files predating raids
+} = require("./config");
+const { getCurrentWar, getCapitalRaidSeason, parseWarDate, cocErrorMessage } = require("./coc_api");
+const {
+  getWarScoreboard,
+  isWarDecided,
+  getWarResult,
+  getTimeRemaining,
+  groupMembersByAttacks,
+  getPlayersToRemind,
+  getMissedAttacks,
+  getRaidPlayersToRemind,
+} = require("./war_analysis");
+const {
+  formatPlayerLine,
+  formatCwlPlayerLine,
+  formatRaidPlayerLine,
+  buildParticipantList,
+  buildWarEndSummary,
+  buildRaidMessage,
+} = require("./discord_messages");
+const { getCurrentCwlWar, getCwlWarsByState } = require("./cwl_api");
 const { groupCwlMembersByAttacks, getCwlPlayersToRemind } = require("./cwl_analysis");
-const { loadSpamGuard, saveSpamGuard } = require("./persistence");
+const { loadSpamGuard, saveSpamGuard, appendWarHistory } = require("./persistence");
 
 // ---- Spam guard factory -------------------------------------
 
@@ -38,10 +62,9 @@ function createSpamGuard() {
   const loaded = loadSpamGuard();
   if (loaded) {
     console.log("[spam-guard] Restored state from disk.");
-    return loaded;
   }
+  // Defaults first, so fields added after the file was written still exist
   return {
-    lastAutoReminderAt: null,
     sentThresholds: {},
     warEndSentForWar: null,
     preparationSentForWar: null,
@@ -53,34 +76,44 @@ function createSpamGuard() {
     cwlPreparationSentForWar: null,
     cwlWarStartSentForWar: null,
     cwlWarEndSentForWar: null,
+    // Raid weekend state (keyed by the raid's endTime)
+    raidSentThresholds: {},
+    raidStartSentFor: null,
+    raidEndSentFor: null,
+    ...loaded,
   };
 }
 
 // ---- Anti-spam helpers --------------------------------------
 
-/** Check if enough time has passed since the last auto-reminder. */
-function canSendAutoReminder(spamGuard) {
-  if (!spamGuard.lastAutoReminderAt) return true;
-  const elapsed = Date.now() - spamGuard.lastAutoReminderAt;
-  return elapsed >= AUTO_CHECK_INTERVAL_MS;
+/**
+ * Pick the countdown threshold to announce now, or null if none is due.
+ *
+ * Returns the smallest threshold already crossed, and marks *every*
+ * crossed threshold as sent — otherwise a bot started at 3h left would
+ * send "< 4h" now, then "< 6h" next cycle, then "< 12h"...
+ *
+ * @param {object}   sentMap      warEndTime → Set of sent thresholds (mutated)
+ * @param {string}   warEndTime   Identifies the war
+ * @param {number}   hoursLeft    Whole hours remaining
+ * @param {number[]} thresholds   Hours before the end that trigger a reminder
+ */
+function claimThreshold(sentMap, warEndTime, hoursLeft, thresholds = REMINDER_THRESHOLDS_HOURS) {
+  const crossed = thresholds.filter((t) => hoursLeft < t);
+  const sent = (sentMap[warEndTime] ??= new Set());
+  if (crossed.every((t) => sent.has(t))) return null;
+  crossed.forEach((t) => sent.add(t));
+  return Math.min(...crossed);
 }
 
-function markAutoReminderSent(spamGuard) {
-  spamGuard.lastAutoReminderAt = Date.now();
-}
-
-/** Check if a specific countdown threshold was already sent for this war. */
-function hasThresholdBeenSent(spamGuard, warEndTime, thresholdHours) {
-  const sent = spamGuard.sentThresholds[warEndTime];
-  return sent ? sent.has(thresholdHours) : false;
-}
-
-/** Record that a threshold was sent so it won't fire again for this war. */
-function markThresholdSent(spamGuard, warEndTime, thresholdHours) {
-  if (!spamGuard.sentThresholds[warEndTime]) {
-    spamGuard.sentThresholds[warEndTime] = new Set();
-  }
-  spamGuard.sentThresholds[warEndTime].add(thresholdHours);
+/** Record an ended war's missed attacks in war_history.json (for /missed). */
+function recordWar(warData, cwl) {
+  appendWarHistory({
+    endTime: warData.endTime,
+    cwl,
+    opponent: warData.opponent.name,
+    members: getMissedAttacks(warData),
+  });
 }
 
 // ---- Automatic war check ------------------------------------
@@ -99,7 +132,7 @@ function markThresholdSent(spamGuard, warEndTime, thresholdHours) {
  *
  * @param {object}   spamGuard        Mutable anti-spam state (persisted to disk)
  * @param {object}   playerDiscordMap  CoC tag → Discord user ID
- * @param {object}   bedtimeMap        Discord user ID → { time, utcOffset }
+ * @param {object}   bedtimeMap        Discord user ID → { time, timeZone }
  * @param {function} sendToChannel     async (text) => void — sends to reminder channel
  */
 async function runAutoWarCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToChannel) {
@@ -148,10 +181,8 @@ async function runAutoWarCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToCh
       if (isWarDecided(scoreboard, warData)) {
         if (spamGuard.warDecidedSentForWar !== warData.endTime) {
           const { clan, opponent } = scoreboard;
-          const resultStr = clan.stars > opponent.stars ? "Victory"
-            : clan.stars < opponent.stars ? "Defeat" : "Tie";
           const recapLines = [
-            `**🏁 War Decided — ${resultStr}!**`,
+            `**🏁 War Decided — ${getWarResult(scoreboard)}!**`,
             `vs **${warData.opponent.name}**`,
             `**⭐** ${clan.stars} - ${opponent.stars}`,
             `**💥** ${clan.destruction.toFixed(1)}% - ${opponent.destruction.toFixed(1)}%`,
@@ -177,12 +208,7 @@ async function runAutoWarCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToCh
             console.log("[auto] War appears to have ended. Skipping.");
           } else {
             // ---- Threshold-based countdown reminders ----
-            let triggeredThreshold = null;
-            for (const threshold of REMINDER_THRESHOLDS_HOURS) {
-              if (remaining.hours < threshold && !hasThresholdBeenSent(spamGuard, warData.endTime, threshold)) {
-                triggeredThreshold = threshold;
-              }
-            }
+            const triggeredThreshold = claimThreshold(spamGuard.sentThresholds, warData.endTime, remaining.hours);
 
             if (triggeredThreshold === null) {
               console.log("[auto] No threshold crossed. Skipping.");
@@ -200,14 +226,18 @@ async function runAutoWarCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToCh
                 reminderLines.push(formatPlayerLine(p, playerDiscordMap));
               }
               await sendToChannel(reminderLines.join("\n"));
-              markThresholdSent(spamGuard, warData.endTime, triggeredThreshold);
-              markAutoReminderSent(spamGuard);
               saveSpamGuard(spamGuard);
               console.log(`[auto] Threshold reminder sent: < ${triggeredThreshold}h`);
             }
           }
         }
       }
+    } else if (warData.state === "warEnded" && spamGuard.warEndSentForWar !== warData.endTime) {
+      recordWar(warData, false);
+      await sendToChannel(buildWarEndSummary(warData, "War Over"));
+      spamGuard.warEndSentForWar = warData.endTime;
+      saveSpamGuard(spamGuard);
+      console.log("[auto] War-ended summary sent.");
     }
   } catch (error) {
     console.error("[auto] Error during scheduled check:", cocErrorMessage(error));
@@ -220,12 +250,22 @@ async function runAutoWarCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToCh
     console.error("[cwl-auto] Error during CWL check:", error.message);
   }
 
+  // ---- Raid weekend (independent of wars) ----
+  try {
+    await runAutoRaidCheck(spamGuard, playerDiscordMap, sendToChannel);
+  } catch (error) {
+    console.error("[raid-auto] Error during raid check:", cocErrorMessage(error));
+  }
+
   // ---- Bedtime reminders (independent of regular reminders) ----
   try {
     await runBedtimeCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToChannel);
   } catch (error) {
     console.error("[bedtime] Error during bedtime check:", error.message);
   }
+
+  // CWL and bedtime checks mutate the guard too — persist once for all
+  saveSpamGuard(spamGuard);
 }
 
 // ---- Automatic CWL check ------------------------------------
@@ -234,11 +274,15 @@ async function runAutoWarCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToCh
  * CWL auto-check: same lifecycle as regular wars but for CWL rounds.
  * Announces prep, battle day start, countdown reminders, and war-ended summary.
  * Silently skips if the clan is not in CWL (404 from the API).
+ *
+ * Rounds overlap (round N battles while N+1 preps and N-1 just ended),
+ * so each cycle looks at all three. Posted in chronological order:
+ * result of N-1, battle day of N, prep of N+1.
  */
 async function runAutoCwlCheck(spamGuard, playerDiscordMap, sendToChannel) {
-  let result;
+  let wars;
   try {
-    result = await getCurrentCwlWar(CLAN_TAG);
+    wars = await getCwlWarsByState(CLAN_TAG);
   } catch (error) {
     if (error.response?.status === 404) {
       // Clan not in CWL — silently skip
@@ -247,16 +291,22 @@ async function runAutoCwlCheck(spamGuard, playerDiscordMap, sendToChannel) {
     throw error;
   }
 
-  if (!result) return;
+  // ---- Previous round ended: post summary ----
+  if (wars.warEnded && spamGuard.cwlWarEndSentForWar !== wars.warEnded.war.endTime) {
+    const { war: warData, roundIndex } = wars.warEnded;
+    recordWar(warData, true);
+    await sendToChannel(buildWarEndSummary(warData, `CWL Round ${roundIndex}`));
+    spamGuard.cwlWarEndSentForWar = warData.endTime;
+    console.log(`[cwl-auto] CWL round ${roundIndex} war-ended summary sent.`);
+  }
 
-  const { war: warData, roundIndex } = result;
+  if (wars.inWar) {
+    await runCwlBattleDay(spamGuard, playerDiscordMap, sendToChannel, wars.inWar);
+  }
 
-  if (warData.state === "notInWar") return;
-
-  // ---- Preparation phase: announce CWL round ----
-  if (warData.state === "preparation") {
-    if (spamGuard.cwlPreparationSentForWar === warData.endTime) return;
-
+  // ---- Next round in preparation: announce it ----
+  if (wars.preparation && spamGuard.cwlPreparationSentForWar !== wars.preparation.war.endTime) {
+    const { war: warData, roundIndex } = wars.preparation;
     const startDate = parseWarDate(warData.startTime);
     const startUnix = Math.floor(startDate.getTime() / 1000);
     const lines = [
@@ -268,11 +318,13 @@ async function runAutoCwlCheck(spamGuard, playerDiscordMap, sendToChannel) {
     await sendToChannel(lines.join("\n"));
     spamGuard.cwlPreparationSentForWar = warData.endTime;
     console.log(`[cwl-auto] CWL round ${roundIndex} preparation announcement sent.`);
-    return;
   }
+}
 
+/** CWL round on battle day: start announcement, then countdown reminders. */
+async function runCwlBattleDay(spamGuard, playerDiscordMap, sendToChannel, { war: warData, roundIndex }) {
   // ---- War just started: announce battle day ----
-  if (warData.state === "inWar" && spamGuard.cwlWarStartSentForWar !== warData.endTime) {
+  if (spamGuard.cwlWarStartSentForWar !== warData.endTime) {
     const endDate = parseWarDate(warData.endTime);
     const endUnix = Math.floor(endDate.getTime() / 1000);
     const lines = [
@@ -289,26 +341,6 @@ async function runAutoCwlCheck(spamGuard, playerDiscordMap, sendToChannel) {
     return;
   }
 
-  // ---- War ended: post summary ----
-  if (warData.state === "warEnded") {
-    if (spamGuard.cwlWarEndSentForWar === warData.endTime) return;
-
-    const scoreboard = getWarScoreboard(warData);
-    const { clan, opponent } = scoreboard;
-    const resultStr = clan.stars > opponent.stars ? "Victory" :
-                      clan.stars < opponent.stars ? "Defeat" : "Tie";
-
-    const lines = [
-      `**🏆 CWL Round ${roundIndex} — ${resultStr}!**`,
-      `**⭐** ${clan.stars} - ${opponent.stars}`,
-      `**💥** ${clan.destruction.toFixed(1)}% - ${opponent.destruction.toFixed(1)}%`,
-    ];
-    await sendToChannel(lines.join("\n"));
-    spamGuard.cwlWarEndSentForWar = warData.endTime;
-    console.log(`[cwl-auto] CWL round ${roundIndex} war-ended summary sent.`);
-    return;
-  }
-
   // ---- inWar: threshold reminders ----
   const scoreboard = getWarScoreboard(warData);
   if (isWarDecided(scoreboard, warData)) return;
@@ -322,15 +354,7 @@ async function runAutoCwlCheck(spamGuard, playerDiscordMap, sendToChannel) {
   const remaining = getTimeRemaining(endDate);
   if (!remaining) return;
 
-  let triggeredThreshold = null;
-  for (const threshold of REMINDER_THRESHOLDS_HOURS) {
-    const sent = spamGuard.cwlSentThresholds[warData.endTime];
-    const alreadySent = sent ? sent.has(threshold) : false;
-    if (remaining.hours < threshold && !alreadySent) {
-      triggeredThreshold = threshold;
-    }
-  }
-
+  const triggeredThreshold = claimThreshold(spamGuard.cwlSentThresholds, warData.endTime, remaining.hours);
   if (triggeredThreshold === null) return;
 
   const label = triggeredThreshold === 1
@@ -346,15 +370,74 @@ async function runAutoCwlCheck(spamGuard, playerDiscordMap, sendToChannel) {
     reminderLines.push(formatCwlPlayerLine(p, playerDiscordMap));
   }
   await sendToChannel(reminderLines.join("\n"));
-
-  if (!spamGuard.cwlSentThresholds[warData.endTime]) {
-    spamGuard.cwlSentThresholds[warData.endTime] = new Set();
-  }
-  spamGuard.cwlSentThresholds[warData.endTime].add(triggeredThreshold);
   console.log(`[cwl-auto] CWL round ${roundIndex} threshold reminder sent: < ${triggeredThreshold}h`);
 }
 
+// ---- Automatic raid weekend check ---------------------------
+
+/**
+ * Raid weekend (Friday → Monday 07:00 UTC): announce the start, remind
+ * players who started raiding but have attacks left at RAID_REMINDER_THRESHOLDS_HOURS, and post
+ * a summary when it ends. Each fires once per raid (keyed by endTime).
+ */
+async function runAutoRaidCheck(spamGuard, playerDiscordMap, sendToChannel) {
+  const raid = await getCapitalRaidSeason(CLAN_TAG);
+  if (!raid) return;
+
+  if (raid.state === "ended") {
+    if (spamGuard.raidEndSentFor === raid.endTime) return;
+    await sendToChannel(buildRaidMessage(raid, playerDiscordMap));
+    spamGuard.raidEndSentFor = raid.endTime;
+    console.log("[raid-auto] Raid weekend summary sent.");
+    return;
+  }
+
+  if (spamGuard.raidStartSentFor !== raid.endTime) {
+    const endUnix = Math.floor(parseWarDate(raid.endTime).getTime() / 1000);
+    await sendToChannel([
+      `**🏰 Raid Weekend has begun!**`,
+      `Ends: <t:${endUnix}:R> (<t:${endUnix}:F>)`,
+      `Don't forget your raid attacks!`,
+    ].join("\n"));
+    spamGuard.raidStartSentFor = raid.endTime;
+    console.log("[raid-auto] Raid weekend start announcement sent.");
+    return;
+  }
+
+  const remaining = getTimeRemaining(parseWarDate(raid.endTime));
+  if (!remaining) return;
+
+  const threshold = claimThreshold(spamGuard.raidSentThresholds, raid.endTime, remaining.hours, RAID_REMINDER_THRESHOLDS_HOURS);
+  if (threshold === null) return;
+
+  const toRemind = getRaidPlayersToRemind(raid);
+  if (toRemind.length === 0) return;
+
+  const lines = [
+    `**🏰⏰ Raid Weekend Reminder (< ${threshold} hours left)**`,
+    "Use your raid attacks!",
+    "",
+    ...toRemind.map((p) => formatRaidPlayerLine(p, playerDiscordMap)),
+  ];
+  await sendToChannel(lines.join("\n"));
+  console.log(`[raid-auto] Raid reminder sent: < ${threshold}h`);
+}
+
 // ---- Bedtime check ------------------------------------------
+
+/** Wall-clock date ("YYYY-MM-DD") and minutes since midnight in an IANA time zone. */
+function localClock(timeZone, date) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone, hourCycle: "h23",
+      year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+    }).formatToParts(date).map((p) => [p.type, p.value])
+  );
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    minutes: Number(parts.hour) * 60 + Number(parts.minute),
+  };
+}
 
 /**
  * Send personal bedtime reminders to players who:
@@ -363,8 +446,8 @@ async function runAutoCwlCheck(spamGuard, playerDiscordMap, sendToChannel) {
  *   3. Have a linked CoC account that still needs to attack
  *   4. Haven't already been reminded today
  *
- * Time calculation converts UTC to the user's local time using
- * their configured UTC offset, then checks the 0–30 minute window.
+ * Local time comes from the user's IANA time zone (e.g. Europe/Paris),
+ * so daylight saving changes are handled automatically.
  */
 async function runBedtimeCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToChannel) {
   const users = Object.entries(bedtimeMap);
@@ -418,23 +501,18 @@ async function runBedtimeCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToCh
 
   const now = new Date();
 
-  for (const [discordId, settings] of users) {
-    const { time, utcOffset } = settings;
+  for (const [discordId, { time, timeZone }] of users) {
     const [bedH, bedM] = time.split(":").map(Number);
 
-    const userNow = new Date(now.getTime() + utcOffset * 60 * 60 * 1000);
-    const userHour = userNow.getUTCHours();
-    const userMin = userNow.getUTCMinutes();
+    // Modulo wraps past midnight: 23:45 → 00:00 bedtime is 15 min away, not -1425
+    const minutesUntilBed = (bedH * 60 + bedM - localClock(timeZone, now).minutes + 1440) % 1440;
 
-    const userDateStr = userNow.toISOString().slice(0, 10);
+    if (minutesUntilBed > 30) continue;
 
-    if (spamGuard.bedtimeRemindedOn[discordId] === userDateStr) continue;
-
-    const bedMinutes = bedH * 60 + bedM;
-    const nowMinutes = userHour * 60 + userMin;
-    const minutesUntilBed = bedMinutes - nowMinutes;
-
-    if (minutesUntilBed < 0 || minutesUntilBed > 30) continue;
+    // Keyed by the bedtime's own date, so 23:50 and 00:20 checks for a
+    // 00:20 bedtime count as the same night
+    const bedDateStr = localClock(timeZone, new Date(now.getTime() + minutesUntilBed * 60000)).date;
+    if (spamGuard.bedtimeRemindedOn[discordId] === bedDateStr) continue;
 
     const linkedTags = reversePlayerMap[discordId];
     if (!linkedTags || linkedTags.length === 0) continue;
@@ -446,8 +524,8 @@ async function runBedtimeCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToCh
     await sendToChannel(
       `🌙 <@${discordId}> — Bedtime in ~${minutesUntilBed} min! You still have ${warType} attacks left. Get them in before you sleep!`
     );
-    spamGuard.bedtimeRemindedOn[discordId] = userDateStr;
-    console.log(`[bedtime] Reminder sent to ${discordId} (${time} UTC${utcOffset >= 0 ? "+" : ""}${utcOffset}).`);
+    spamGuard.bedtimeRemindedOn[discordId] = bedDateStr;
+    console.log(`[bedtime] Reminder sent to ${discordId} (${time} ${timeZone}).`);
   }
 }
 
@@ -455,4 +533,5 @@ module.exports = {
   createSpamGuard,
   runAutoWarCheck,
   runBedtimeCheck,
+  claimThreshold,
 };

@@ -43,6 +43,9 @@ const AUTO_CHECK_INTERVAL_MS = 30 * 60 * 1000;       // 30 minutes
 // reminder pings. Each threshold fires only once per war.
 const REMINDER_THRESHOLDS_HOURS = [12, 6, 4, 2, 1];
 
+// Same idea for Clan Capital raid weekends (Friday → Monday 07:00 UTC).
+const RAID_REMINDER_THRESHOLDS_HOURS = [24, 4];
+
 // ---- Caches -------------------------------------------------
 
 // How long the clan member list is cached for autocomplete (milliseconds).
@@ -58,5 +61,6 @@ module.exports = {
   GUILDS,
   AUTO_CHECK_INTERVAL_MS,
   REMINDER_THRESHOLDS_HOURS,
+  RAID_REMINDER_THRESHOLDS_HOURS,
   MEMBER_CACHE_TTL_MS,
 };

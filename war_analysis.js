@@ -8,6 +8,7 @@
 // - Deciding if a war's outcome is already locked in
 // - Grouping members by how many attacks they've used
 // - Deciding who still needs to be reminded
+// - Missed-attack history and Clan Capital raid reminders
 //
 // These are pure functions (no side effects) so they're easy to
 // test and reuse across the CLI tool and the Discord bot.
@@ -94,7 +95,8 @@ function isWarDecided(scoreboard, warData) {
   if (clan.stars >= clan.maxStars) return true;
 
   // Calculate how many attacks each side still has
-  const maxAttacks = warData.teamSize * 2;  // 2 attacks per player
+  // (attacksPerMember is 2 in regular wars, 1 in CWL)
+  const maxAttacks = warData.teamSize * (warData.attacksPerMember ?? 2);
   const clanAttacksUsed = countAttacksUsed(warData.clan);
   const opponentAttacksUsed = countAttacksUsed(warData.opponent);
   const clanRemaining = maxAttacks - clanAttacksUsed;
@@ -114,6 +116,17 @@ function isWarDecided(scoreboard, warData) {
   if (clanRemaining === 0 && opponentRemaining === 0) return true;
 
   return false;
+}
+
+/**
+ * "Victory" / "Defeat" / "Tie" from our side's point of view.
+ * Stars first, destruction as tiebreaker (in-game rules).
+ */
+function getWarResult(scoreboard) {
+  const { clan, opponent } = scoreboard;
+  if (clan.stars !== opponent.stars) return clan.stars > opponent.stars ? "Victory" : "Defeat";
+  if (clan.destruction !== opponent.destruction) return clan.destruction > opponent.destruction ? "Victory" : "Defeat";
+  return "Tie";
 }
 
 /** Check if a member landed at least one 3-star attack. */
@@ -177,11 +190,62 @@ function getPlayersToRemind(groups) {
   return toRemind;
 }
 
+/**
+ * Missed attacks per member of our side, once the war is over.
+ * Everyone is listed (missed may be 0) so the history also knows who played.
+ */
+function getMissedAttacks(warData) {
+  const perMember = warData.attacksPerMember ?? 2;
+  return (warData.clan.members || []).map((m) => ({
+    tag: m.tag,
+    name: m.name,
+    missed: perMember - (m.attacks?.length ?? 0),
+  }));
+}
+
+/**
+ * Aggregate recorded wars (see persistence.appendWarHistory) into
+ * per-player totals. Only players who missed at least once, worst first.
+ */
+function computeMissedAttacks(wars) {
+  const players = {};
+  for (const war of wars) {
+    for (const m of war.members) {
+      const p = (players[m.tag] ??= { name: m.name, missed: 0, wars: 0 });
+      p.name = m.name;  // keep the latest name
+      p.missed += m.missed;
+      p.wars++;
+    }
+  }
+  return Object.values(players)
+    .filter((p) => p.missed > 0)
+    .sort((a, b) => b.missed - a.missed || a.wars - b.wars);
+}
+
+// ---- Clan Capital raids -------------------------------------
+
+/**
+ * Players who started raiding this weekend but still have attacks left.
+ * Members who never raid aren't nagged — raid.members (from the API)
+ * only lists players who attacked at least once anyway.
+ *
+ * @param {object} raid  Raid season from getCapitalRaidSeason()
+ */
+function getRaidPlayersToRemind(raid) {
+  return (raid.members || [])
+    .map((m) => ({ name: m.name, tag: m.tag, attacks: m.attacks, limit: m.attackLimit + m.bonusAttackLimit }))
+    .filter((p) => p.attacks < p.limit);
+}
+
 module.exports = {
   getTimeRemaining,
   getWarScoreboard,
   countAttacksUsed,
   isWarDecided,
+  getWarResult,
   groupMembersByAttacks,
   getPlayersToRemind,
+  getMissedAttacks,
+  computeMissedAttacks,
+  getRaidPlayersToRemind,
 };

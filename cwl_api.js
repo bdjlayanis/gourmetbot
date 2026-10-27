@@ -6,6 +6,7 @@
 // one call for the league group, then one call per war per round.
 // This module combines those calls into higher-level operations:
 //
+//   getCwlWarsByState()      — Our latest prep / battle-day / ended CWL wars
 //   getCurrentCwlWar()       — Find the active/latest CWL war for our clan
 //   getAllCwlWarsForClan()   — Get all our CWL wars (for /cwl-stats)
 //   getAllCwlRoundWars()     — Get every war across all clans (for /cwl-standings)
@@ -55,48 +56,43 @@ async function findOurCwlWar(warTags, clanTag) {
 }
 
 /**
- * Get the current (active or most recent) CWL war for our clan.
+ * Find our latest CWL war in each state.
  *
- * Iterates rounds backwards (newest first) looking for:
- *   1. An active war (inWar) — return immediately
- *   2. A prep-phase war (preparation) — return immediately
- *   3. The most recently ended war — return as fallback
+ * CWL rounds overlap: while round N is on battle day, round N+1 is
+ * already in preparation and round N-1 has just ended. The scheduler
+ * needs all three to announce prep / battle day / result for every round.
  *
  * roundIndex is 1-based (Round 1, Round 2, ...) for display purposes.
  *
  * @param {string} clanTag  Our clan tag
- * @returns {{ war: object, roundIndex: number, leagueGroup: object }|null}
+ * @returns {{ preparation, inWar, warEnded }}  each { war, roundIndex } or null
  */
-async function getCurrentCwlWar(clanTag) {
+async function getCwlWarsByState(clanTag) {
   const leagueGroup = await getCwlLeagueGroup(clanTag);
   const rounds = leagueGroup.rounds || [];
+  const found = { preparation: null, inWar: null, warEnded: null };
 
-  let bestWar = null;      // fallback: most recent non-inWar war
-  let bestRoundIndex = -1;
-
-  for (let i = rounds.length - 1; i >= 0; i--) {
-    const warTags = rounds[i].warTags || [];
-    const war = await findOurCwlWar(warTags, clanTag);
-
-    if (!war) continue;
-
-    // Active battle day — always highest priority
-    if (war.state === "inWar") {
-      return { war, roundIndex: i + 1, leagueGroup };
-    }
-
-    // Save the most recent prep or ended war as fallback
-    if ((war.state === "preparation" || war.state === "warEnded") && !bestWar) {
-      bestWar = war;
-      bestRoundIndex = i + 1;
+  // Newest round first; once we hit an ended round, every older one is ended too
+  for (let i = rounds.length - 1; i >= 0 && !found.warEnded; i--) {
+    const war = await findOurCwlWar(rounds[i].warTags || [], clanTag);
+    if (war && war.state in found && !found[war.state]) {
+      found[war.state] = { war, roundIndex: i + 1 };
     }
   }
 
-  if (bestWar) {
-    return { war: bestWar, roundIndex: bestRoundIndex, leagueGroup };
-  }
+  return found;
+}
 
-  return null;
+/**
+ * Get the current CWL war for our clan: the active battle day if any,
+ * else the upcoming prep round, else the most recently ended round.
+ *
+ * @param {string} clanTag  Our clan tag
+ * @returns {{ war: object, roundIndex: number }|null}
+ */
+async function getCurrentCwlWar(clanTag) {
+  const { inWar, preparation, warEnded } = await getCwlWarsByState(clanTag);
+  return inWar ?? preparation ?? warEnded;
 }
 
 /**
@@ -149,6 +145,7 @@ async function getAllCwlRoundWars(leagueGroup) {
 
 module.exports = {
   findOurCwlWar,
+  getCwlWarsByState,
   getCurrentCwlWar,
   getAllCwlWarsForClan,
   getAllCwlRoundWars,

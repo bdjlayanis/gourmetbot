@@ -22,13 +22,18 @@ const { DISCORD_BOT_TOKEN, GUILDS, AUTO_CHECK_INTERVAL_MS } = require("./config"
 const { loadPlayerMap, loadBedtimeMap } = require("./persistence");
 const { createSpamGuard, runAutoWarCheck } = require("./scheduler");
 const { registerCommands, setupHandlers } = require("./commands");
+const { toEmbedMessages } = require("./discord_messages");
+
+// One failed interaction (expired token, missing permission...) must not
+// take the whole bot down — Node exits on unhandled rejections by default.
+process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
 
 // ---- Load persistent state ----------------------------------
 // These are mutable objects shared across the bot's lifetime.
 // Commands and the scheduler both read/write to them.
 
 const playerDiscordMap = loadPlayerMap();   // CoC tag → Discord user ID
-const bedtimeMap = loadBedtimeMap();        // Discord ID → { time, utcOffset }
+const bedtimeMap = loadBedtimeMap();        // Discord ID → { time, timeZone }
 const spamGuard = createSpamGuard();        // anti-spam state (restored from disk)
 
 // ---- Discord client -----------------------------------------
@@ -51,7 +56,7 @@ async function sendToReminderChannel(text) {
         console.error(`Reminder channel ${reminderChannelId} is not a text channel or was not found.`);
         continue;
       }
-      await channel.send(text);
+      for (const message of toEmbedMessages(text)) await channel.send(message);
     } catch (err) {
       console.error(`Failed to send to reminder channel ${reminderChannelId}:`, err.message);
     }
@@ -62,6 +67,7 @@ async function sendToReminderChannel(text) {
 // Attach autocomplete + slash command listeners to the client.
 
 setupHandlers(client, playerDiscordMap, bedtimeMap);
+client.on("error", (err) => console.error("Discord client error:", err));
 
 client.once("ready", async () => {
   console.log(`Bot logged in as ${client.user.tag}`);
@@ -70,10 +76,9 @@ client.once("ready", async () => {
   console.log(
     `Scheduler started: auto war-check every ${AUTO_CHECK_INTERVAL_MS / 60000} minutes.`
   );
-  setInterval(
-    () => runAutoWarCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToReminderChannel),
-    AUTO_CHECK_INTERVAL_MS
-  );
+  const runCheck = () => runAutoWarCheck(spamGuard, playerDiscordMap, bedtimeMap, sendToReminderChannel);
+  runCheck();  // don't wait a full interval after a restart
+  setInterval(runCheck, AUTO_CHECK_INTERVAL_MS);
 
   console.log("Ready. Use /war-check or wait for automatic reminders.");
 });

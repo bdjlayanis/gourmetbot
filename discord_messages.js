@@ -3,11 +3,13 @@
 // =============================================================
 //
 // Every piece of text the bot sends to Discord is built here.
-// Functions take raw data and return a plain string (Discord markdown).
+// Functions take raw data and return a plain string (Discord markdown);
+// toEmbedMessages() turns that string into embed payloads at send time.
 //
-// Split into two sections:
+// Split into three sections:
 //   1. Regular war messages  (buildWarMessage, buildClanStatsMessage, etc.)
 //   2. CWL messages          (buildCwlWarMessage, buildCwlStandingsMessage, etc.)
+//   3. Raid weekend messages (buildRaidMessage)
 //
 // Design rule: formatters are pure — they take a playerDiscordMap as
 // a parameter instead of reading a global, making them testable.
@@ -17,9 +19,12 @@ const { parseWarDate } = require("./coc_api");
 const {
   getWarScoreboard,
   isWarDecided,
+  getWarResult,
   getTimeRemaining,
   groupMembersByAttacks,
   getPlayersToRemind,
+  getMissedAttacks,
+  getRaidPlayersToRemind,
 } = require("./war_analysis");
 const {
   groupCwlMembersByAttacks,
@@ -27,6 +32,54 @@ const {
 } = require("./cwl_analysis");
 
 // ---- Formatters ---------------------------------------------
+
+/**
+ * Split text into chunks that fit Discord's 2000-char message limit,
+ * cutting on line breaks. A 50v50 war's attack details need several.
+ */
+function splitMessage(text, max = 2000) {
+  const chunks = [];
+  let current = "";
+  for (const line of text.split("\n")) {
+    if (current && current.length + line.length + 1 > max) {
+      chunks.push(current);
+      current = "";
+    }
+    current += (current ? "\n" : "") + line;
+  }
+  chunks.push(current);
+  return chunks;
+}
+
+/** Embed color from the title: green win, red loss, orange reminder, gold otherwise. */
+function embedColor(title) {
+  if (title.includes("Victory")) return 0x2ecc71;
+  if (title.includes("Defeat")) return 0xe74c3c;
+  if (/Reminder|Bedtime/.test(title)) return 0xe67e22;
+  return 0xf1c40f;
+}
+
+/**
+ * Turn a markdown message into Discord message payloads with an embed.
+ * First line → embed title, the rest → description, split at the 4096-char
+ * description limit (one embed per message).
+ *
+ * Mentions don't ping inside embeds, so every <@id> found is repeated
+ * in the first message's plain content.
+ */
+function toEmbedMessages(text) {
+  const [first, ...rest] = text.split("\n");
+  const hasTitle = !first.includes("<@");  // titles can't render mentions
+  const title = hasTitle ? first.replaceAll("**", "") : undefined;
+  const body = (hasTitle ? rest : [first, ...rest]).join("\n").trim();
+  const mentions = [...new Set(text.match(/<@\d+>/g) ?? [])];
+  const color = embedColor(first);
+
+  return splitMessage(body, 4096).map((chunk, i) => ({
+    content: i === 0 && mentions.length > 0 ? mentions.join(" ") : undefined,
+    embeds: [{ title: i === 0 ? title : undefined, description: chunk || undefined, color }],
+  }));
+}
 
 /**
  * Format a single player line for war reminder messages.
@@ -254,6 +307,29 @@ function buildWarMessage(warData, playerDiscordMap, { isManual = false } = {}) {
 
   lines.push(buildAttackDetails(warData));
 
+  return lines.join("\n");
+}
+
+/**
+ * Short recap posted automatically when a war (or CWL round) ends:
+ * result, score, and who left attacks unused. Names only, no pings.
+ */
+function buildWarEndSummary(warData, title) {
+  const scoreboard = getWarScoreboard(warData);
+  const { clan, opponent } = scoreboard;
+  const missed = getMissedAttacks(warData)
+    .filter((m) => m.missed > 0)
+    .map((m) => `${m.name} (${m.missed})`);
+
+  const lines = [
+    `**🏁 ${title} — ${getWarResult(scoreboard)}!**`,
+    `vs **${warData.opponent.name}**`,
+    `**⭐** ${clan.stars} - ${opponent.stars}`,
+    `**💥** ${clan.destruction.toFixed(1)}% - ${opponent.destruction.toFixed(1)}%`,
+  ];
+  if (missed.length > 0) {
+    lines.push("", `**Missed attacks:** ${missed.join(", ")}`);
+  }
   return lines.join("\n");
 }
 
@@ -519,16 +595,82 @@ function buildCwlStatsMessage(playerStats, season) {
     );
   }
 
-  // Discord has a 2000-character message limit — truncate if needed
-  let result = lines.join("\n");
-  if (result.length > 1950) {
-    result = result.slice(0, 1950) + "\n*(truncated)*";
+  return lines.join("\n");
+}
+
+/** Build the /missed response: players ranked by missed attacks over a period. */
+function buildMissedAttacksMessage(playerStats, days, warCount) {
+  const lines = [`**📉 Missed Attacks — last ${days} days**`];
+
+  if (warCount === 0) {
+    lines.push("No ended war recorded in this period yet — history is collected as wars end.");
+    return lines.join("\n");
   }
 
-  return result;
+  lines.push(`${warCount} war${warCount === 1 ? "" : "s"} tracked (CWL rounds included)`, "");
+  if (playerStats.length === 0) {
+    lines.push("✅ Nobody missed an attack!");
+  }
+  for (const p of playerStats) {
+    lines.push(`**${p.name}** — ${p.missed} missed in ${p.wars} war${p.wars === 1 ? "" : "s"}`);
+  }
+  return lines.join("\n");
+}
+
+// ---- Raid weekend message builders --------------------------
+
+/** Raid reminder line: "@player (2/6 attacks)", @mention only if linked. */
+function formatRaidPlayerLine(player, playerDiscordMap, { suppressPing = false } = {}) {
+  const discordId = playerDiscordMap[player.tag];
+  const label = discordId && !suppressPing ? `<@${discordId}>` : `**${player.name}**`;
+  return `${label} (${player.attacks}/${player.limit} attacks)`;
+}
+
+/**
+ * Build the raid weekend status: /raid-check, and the auto summary when it ends.
+ * Ongoing → totals + who still has attacks left. Ended → totals, medals, top looters.
+ *
+ * @param {object|null} raid  Raid season from getCapitalRaidSeason()
+ */
+function buildRaidMessage(raid, playerDiscordMap, { isManual = false } = {}) {
+  if (!raid) return "This clan hasn't done any raid weekend yet.";
+
+  const ongoing = raid.state === "ongoing";
+  const endUnix = Math.floor(parseWarDate(raid.endTime).getTime() / 1000);
+  const lines = [
+    `**🏰 Raid Weekend — ${ongoing ? "In Progress" : "Ended"}**`,
+    `${ongoing ? "Ends" : "Ended"}: <t:${endUnix}:R> (<t:${endUnix}:F>)`,
+    `💰 **Loot:** ${raid.capitalTotalLoot.toLocaleString("en-US")}  |  ⚔️ **Attacks:** ${raid.totalAttacks}  |  🏚️ **Districts destroyed:** ${raid.enemyDistrictsDestroyed}`,
+  ];
+
+  if (!ongoing) {
+    const top = [...(raid.members || [])]
+      .sort((a, b) => b.capitalResourcesLooted - a.capitalResourcesLooted)
+      .slice(0, 3);
+    lines.push(`🏅 **Raid medals:** ${raid.offensiveReward + raid.defensiveReward}`, "", "**Top raiders:**");
+    top.forEach((m, i) => lines.push(`${["🥇", "🥈", "🥉"][i]} ${m.name} — ${m.capitalResourcesLooted.toLocaleString("en-US")}`));
+    return lines.join("\n");
+  }
+
+  const toRemind = getRaidPlayersToRemind(raid);
+  if (toRemind.length === 0) {
+    lines.push("", "✅ Everyone who started raiding has used all their attacks!");
+  } else {
+    lines.push("", `**⚠️ Attacks left (${toRemind.length} players):**`);
+    for (const p of toRemind) {
+      lines.push(formatRaidPlayerLine(p, playerDiscordMap, { suppressPing: isManual }));
+    }
+  }
+  return lines.join("\n");
 }
 
 module.exports = {
+  splitMessage,
+  toEmbedMessages,
+  buildWarEndSummary,
+  buildMissedAttacksMessage,
+  formatRaidPlayerLine,
+  buildRaidMessage,
   formatPlayerLine,
   formatWarDate,
   buildParticipantList,

@@ -14,6 +14,8 @@ player_map.json
 bedtime_map.json
 spam_guard.json
 spam_guard.json.tmp
+war_history.json
+war_history.json.tmp
 
 # Claude Code
 .claude/
