@@ -76,7 +76,8 @@ function toEmbedMessages(text) {
   const color = embedColor(first);
 
   return splitMessage(body, 4096).map((chunk, i) => ({
-    content: i === 0 && mentions.length > 0 ? mentions.join(" ") : undefined,
+    // Title in the content too: the push notification only shows the content
+    content: i === 0 && mentions.length > 0 ? [title, ...mentions].filter(Boolean).join(" ") : undefined,
     embeds: [{ title: i === 0 ? title : undefined, description: chunk || undefined, color }],
   }));
 }
@@ -647,7 +648,8 @@ function buildRaidMessage(raid, playerDiscordMap, { isManual = false } = {}) {
     const top = [...(raid.members || [])]
       .sort((a, b) => b.capitalResourcesLooted - a.capitalResourcesLooted)
       .slice(0, 3);
-    lines.push(`🏅 **Raid medals:** ${raid.offensiveReward + raid.defensiveReward}`, "", "**Top raiders:**");
+    // The API's offensiveReward is per attack: a full raider (6 attacks) gets 6×
+    lines.push(`🏅 **Raid medals:** ${raid.offensiveReward * 6 + raid.defensiveReward} (with 6 attacks)`, "", "**Top raiders:**");
     top.forEach((m, i) => lines.push(`${["🥇", "🥈", "🥉"][i]} ${m.name} — ${m.capitalResourcesLooted.toLocaleString("en-US")}`));
     return lines.join("\n");
   }

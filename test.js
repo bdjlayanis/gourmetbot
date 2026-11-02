@@ -8,7 +8,7 @@
 const assert = require("assert");
 const { isWarDecided, getWarScoreboard, getWarResult, getMissedAttacks, computeMissedAttacks, getRaidPlayersToRemind } = require("./war_analysis");
 const { computeCwlStandings } = require("./cwl_analysis");
-const { splitMessage, toEmbedMessages, buildWarEndSummary } = require("./discord_messages");
+const { splitMessage, toEmbedMessages, buildWarEndSummary, buildRaidMessage } = require("./discord_messages");
 const { claimThreshold } = require("./scheduler");
 const { offsetToTimeZone } = require("./persistence");
 
@@ -63,11 +63,15 @@ const raid = { members: [
   { tag: "#3", name: "Started", attacks: 2, attackLimit: 5, bonusAttackLimit: 0 },
 ] };
 assert.deepStrictEqual(getRaidPlayersToRemind(raid).map((p) => [p.name, p.attacks, p.limit]), [["Bonus", 5, 6], ["Started", 2, 5]]);
+// Raid medals: offensiveReward is per attack (real weekend of 2026-11-02: 160×6 + 119)
+const endedRaid = { members: raid.members.map((m) => ({ ...m, capitalResourcesLooted: 1 })), state: "ended", endTime: "20261102T070000.000Z", capitalTotalLoot: 0, totalAttacks: 0,
+  enemyDistrictsDestroyed: 0, offensiveReward: 160, defensiveReward: 119 };
+assert.match(buildRaidMessage(endedRaid, {}), /Raid medals:\*\* 1079 /);
 
 // Embeds: first line → title, mentions repeated in content (embeds don't ping), long bodies split at 4096
 const [msg] = toEmbedMessages("**⏰ War Reminder**\nGo!\n<@1> (0 attacks)\n<@2> (0 attacks)");
 assert.strictEqual(msg.embeds[0].title, "⏰ War Reminder");
-assert.strictEqual(msg.content, "<@1> <@2>");
+assert.strictEqual(msg.content, "⏰ War Reminder <@1> <@2>");
 assert.strictEqual(toEmbedMessages("🌙 <@9> — Bedtime soon")[0].embeds[0].title, undefined);
 const many = toEmbedMessages("**Big**\n" + long + "\n" + long);
 assert.ok(many.length > 1 && many.every((m) => m.embeds[0].description.length <= 4096) && many[1].content === undefined);
